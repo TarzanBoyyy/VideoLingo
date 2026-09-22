@@ -1,4 +1,5 @@
 from ruamel.yaml import YAML
+import os
 import threading
 
 CONFIG_PATH = 'config.yaml'
@@ -11,7 +12,22 @@ yaml.preserve_quotes = True
 # load & update config
 # -----------------------
 
+# Dashboard (~/project/video-dashboard) đặt provider dịch qua env cho từng job, để đổi
+# nhà cung cấp không phải sửa config.yaml giữa các job — cùng kiểu với VIENEU_VOICE
+# của core/tts_backend/custom_tts.py và VL_KEEP_SRC_SUB của core/_7_sub_into_vid.py.
+ENV_OVERRIDES = {
+    "api.base_url": "VL_API_BASE_URL",
+    "api.model": "VL_API_MODEL",
+    "api.key": "VL_API_KEY",
+}
+
 def load_key(key):
+    env_name = ENV_OVERRIDES.get(key)
+    if env_name:
+        value = os.environ.get(env_name)
+        if value:
+            return value
+
     with lock:
         with open(CONFIG_PATH, 'r', encoding='utf-8') as file:
             data = yaml.load(file)

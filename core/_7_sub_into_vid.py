@@ -72,17 +72,43 @@ def merge_subtitles_to_video():
     TARGET_HEIGHT = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
     video.release()
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
+
+    # Optional: skip burning the original (source-language) subtitles
+    keep_src = os.environ.get("VL_KEEP_SRC_SUB", "1") != "0"
+    src_filter = (
+        f"subtitles={SRC_SRT}:force_style='FontSize={int(TARGET_HEIGHT*0.028)},FontName={FONT_NAME},"
+        f"PrimaryColour={SRC_FONT_COLOR},OutlineColour={SRC_OUTLINE_COLOR},Outline={SRC_OUTLINE_WIDTH},"
+        f"ShadowColour={SRC_SHADOW_COLOR},BorderStyle=1,PlayResX={TARGET_WIDTH},PlayResY={TARGET_HEIGHT}',"
+    ) if keep_src else ""
+
+    # Subtitle-overlay recipe (subdetect): burn translated subs via a generated
+    # .ass that covers the original subtitle band; else fixed fallback style.
+    recipe_path = os.environ.get("VL_SUB_RECIPE")
+    if recipe_path and os.path.exists(recipe_path):
+        from core import substyle
+        ass_path = substyle.build_ass(
+            TRANS_SRT,
+            recipe_path,
+            os.environ.get("VL_SUB_INTERVALS"),
+            os.path.join(OUTPUT_DIR, "trans_recipe.ass"),
+            extras_path=os.environ.get("VL_SUB_EXTRAS"),
+        )
+        rprint(f"[bold green]substyle: built {ass_path} from recipe {recipe_path}[/bold green]")
+        trans_filter = f"ass={substyle.ass_filter_path(ass_path)}"
+    else:
+        trans_filter = (
+            f"subtitles={TRANS_SRT}:force_style='FontSize={int(TARGET_HEIGHT*0.035)},FontName={TRANS_FONT_NAME},"
+            f"PrimaryColour={TRANS_FONT_COLOR},OutlineColour={TRANS_OUTLINE_COLOR},Outline=2,"
+            f"Alignment=2,MarginV={int(TARGET_HEIGHT*0.07)},PlayResX={TARGET_WIDTH},PlayResY={TARGET_HEIGHT}'"
+        )
+
     ffmpeg_cmd = [
         'ffmpeg', '-i', video_file,
         '-vf', (
             f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
             f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
-            f"subtitles={SRC_SRT}:force_style='FontSize={SRC_FONT_SIZE},FontName={FONT_NAME}," 
-            f"PrimaryColour={SRC_FONT_COLOR},OutlineColour={SRC_OUTLINE_COLOR},OutlineWidth={SRC_OUTLINE_WIDTH},"
-            f"ShadowColour={SRC_SHADOW_COLOR},BorderStyle=1',"
-            f"subtitles={TRANS_SRT}:force_style='FontSize={TRANS_FONT_SIZE},FontName={TRANS_FONT_NAME},"
-            f"PrimaryColour={TRANS_FONT_COLOR},OutlineColour={TRANS_OUTLINE_COLOR},OutlineWidth={TRANS_OUTLINE_WIDTH},"
-            f"BackColour={TRANS_BACK_COLOR},Alignment=2,MarginV=27,BorderStyle=4'"
+            f"{src_filter}"
+            f"{trans_filter}"
         ).encode('utf-8'),
     ]
 

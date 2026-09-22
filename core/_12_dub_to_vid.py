@@ -1,3 +1,4 @@
+import os
 import platform
 import subprocess
 
@@ -62,20 +63,43 @@ def merge_video_audio():
     video.release()
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
     
-    subtitle_filter = (
-        f"subtitles={DUB_SUB_FILE}:force_style='FontSize={TRANS_FONT_SIZE},"
-        f"FontName={TRANS_FONT_NAME},PrimaryColour={TRANS_FONT_COLOR},"
-        f"OutlineColour={TRANS_OUTLINE_COLOR},OutlineWidth={TRANS_OUTLINE_WIDTH},"
-        f"BackColour={TRANS_BACK_COLOR},Alignment=2,MarginV=27,BorderStyle=4'"
-    )
+    # Subtitle-overlay recipe (subdetect): burn dub subs via a generated .ass
+    # that covers the original subtitle band; else fixed fallback style.
+    recipe_path = os.environ.get("VL_SUB_RECIPE")
+    if recipe_path and os.path.exists(recipe_path):
+        from core import substyle
+        ass_path = substyle.build_ass(
+            DUB_SUB_FILE,
+            recipe_path,
+            os.environ.get("VL_SUB_INTERVALS"),
+            "output/dub_recipe.ass",
+            extras_path=os.environ.get("VL_SUB_EXTRAS"),
+        )
+        rprint(f"[bold green]substyle: built {ass_path} from recipe {recipe_path}[/bold green]")
+        subtitle_filter = f"ass={substyle.ass_filter_path(ass_path)}"
+    else:
+        subtitle_filter = (
+            f"subtitles={DUB_SUB_FILE}:force_style='FontSize={int(TARGET_HEIGHT*0.035)},"
+            f"FontName={TRANS_FONT_NAME},PrimaryColour={TRANS_FONT_COLOR},"
+            f"OutlineColour={TRANS_OUTLINE_COLOR},Outline=2,"
+            f"Alignment=2,MarginV={int(TARGET_HEIGHT*0.07)},"
+            f"PlayResX={TARGET_WIDTH},PlayResY={TARGET_HEIGHT}'"
+        )
     
     cmd = [
         'ffmpeg', '-y', '-i', VIDEO_FILE, '-i', background_file, '-i', normalized_dub_audio,
         '-filter_complex',
         f'[0:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,'
         f'pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,'
+        # normalize=0: amix mặc định chia mỗi nguồn cho 2 ⇒ giọng lồng mất ~6dB.
+        # BGM chạy 0.9 và bị sidechaincompress duck khi có giọng Việt — nhạc rõ
+        # ở khoảng trống, tự nhỏ dưới lời thoại; alimiter chống clip.
         f'{subtitle_filter}[v];'
-        f'[1:a][2:a]amix=inputs=2:duration=first:dropout_transition=3[a]'
+        f'[1:a]volume=0.9[bgm];'
+        f'[2:a]asplit=2[dubmix][dubkey];'
+        f'[bgm][dubkey]sidechaincompress=threshold=0.02:ratio=8:attack=15:release=400:makeup=1[bgduck];'
+        f'[bgduck][dubmix]amix=inputs=2:duration=first:dropout_transition=3:normalize=0[mix];'
+        f'[mix]alimiter=limit=0.891[a]'
     ]
 
     if load_key("ffmpeg_gpu"):

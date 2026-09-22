@@ -187,6 +187,58 @@ Note: Start you answer with ```json and end with ```, do not add any other text.
     return prompt_faithfulness.strip()
 
 
+def get_prompt_direct_and_free(lines, shared_prompt):
+    """Merged two-stage translation in ONE call: model emits `direct` (faithful)
+    then `free` (natural, refined) per line — the free pass conditions on the
+    direct one inside the same generation, so reflection quality is preserved
+    while only a single request is made. No `origin` echo: keys map to input
+    line order, saving ~40% of output tokens vs the 2-call flow."""
+    TARGET_LANGUAGE = load_key("target_language")
+    line_splits = lines.split('\n')
+
+    json_dict = {
+        f"{i}": {
+            "direct": f"faithful {TARGET_LANGUAGE} translation {i}",
+            "free": f"natural {TARGET_LANGUAGE} subtitle {i}",
+        }
+        for i, _line in enumerate(line_splits, 1)
+    }
+    json_format = json.dumps(json_dict, indent=2, ensure_ascii=False)
+
+    src_language = load_key("whisper.detected_language")
+    prompt = f'''
+## Role
+You are a professional Netflix subtitle translator, fluent in both {src_language} and {TARGET_LANGUAGE}, as well as their respective cultures.
+
+## Task
+For each line of the original {src_language} subtitles, produce TWO versions in one pass:
+1. `direct`: a faithful translation that accurately conveys the original meaning, correct terminology, and context
+2. `free`: a refined, natural, fluent {TARGET_LANGUAGE} subtitle based on your direct version — concise, spoken-style, easy for {TARGET_LANGUAGE} audiences, adapted to the content's theme and tone
+
+{shared_prompt}
+
+<translation_principles>
+1. Faithful to the original: accurately convey content and meaning, without arbitrarily changing, adding, or omitting content.
+2. Accurate terminology: use professional terms correctly and consistently.
+3. For `free`: improve fluency and conciseness over `direct` — this text is read aloud and shown on screen, so keep it natural and tight.
+4. Do not add comments or explanations inside the translations.
+</translation_principles>
+
+## INPUT
+<subtitles>
+{lines}
+</subtitles>
+
+## Output in only JSON format and no other text
+```json
+{json_format}
+```
+
+Note: Start you answer with ```json and end with ```, do not add any other text.
+'''
+    return prompt.strip()
+
+
 def get_prompt_expressiveness(faithfulness_result, lines, shared_prompt):
     TARGET_LANGUAGE = load_key("target_language")
     json_format = {

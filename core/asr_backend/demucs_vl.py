@@ -27,19 +27,21 @@ def demucs_audio():
     console = Console()
     os.makedirs(_AUDIO_DIR, exist_ok=True)
     
-    console.print("🤖 Loading <htdemucs> model...")
-    model = get_model('htdemucs')
+    # htdemucs_ft: bản fine-tune của htdemucs — stem sạch hơn (đặc biệt giọng nói
+    # đè nhạc), chậm ~4x nhưng vẫn nhanh trên GPU.
+    console.print("🤖 Loading <htdemucs_ft> model...")
+    model = get_model('htdemucs_ft')
     separator = PreloadedSeparator(model=model, shifts=1, overlap=0.25)
     
     console.print("🎵 Separating audio...")
     _, outputs = separator.separate_audio_file(_RAW_AUDIO_FILE)
-    
-    kwargs = {"samplerate": model.samplerate, "bitrate": 128, "preset": 2, 
+
+    kwargs = {"samplerate": model.samplerate, "bitrate": 128, "preset": 2,
              "clip": "rescale", "as_float": False, "bits_per_sample": 16}
-    
+
     console.print("🎤 Saving vocals track...")
     save_audio(outputs['vocals'].cpu(), _VOCAL_AUDIO_FILE, **kwargs)
-    
+
     console.print("🎹 Saving background music...")
     background = sum(audio for source, audio in outputs.items() if source != 'vocals')
     save_audio(background.cpu(), _BACKGROUND_AUDIO_FILE, **kwargs)

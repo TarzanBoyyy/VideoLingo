@@ -140,7 +140,9 @@ def process_chunk(chunk_df: pd.DataFrame, accept: float, min_speed: float) -> tu
     elif (chunk_durs + all_gaps) / accept < tol_durs:
         speed_factor = max(min_speed, (chunk_durs + all_gaps) / (tol_durs-speed_var_error))
     else:
-        speed_factor = chunk_durs / (tol_durs-speed_var_error)
+        # Không bao giờ kéo chậm giọng (speed_factor < 1): tiếng Việt ngắn hơn
+        # khung câu gốc thì cứ đọc tốc độ tự nhiên, phần dư để khoảng lặng.
+        speed_factor = max(min_speed, chunk_durs / (tol_durs-speed_var_error))
         keep_gaps = False
         
     return round(speed_factor, 3), keep_gaps
