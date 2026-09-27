@@ -106,6 +106,7 @@ def assign_words(
     *,
     min_ratio: float = 0.5,
     zero_len_gap: float = 0.3,
+    edge_collar: float | None = 0.3,
 ) -> list[dict]:
     """Gắn `speaker` cho từng chữ (không phải dấu câu) theo chồng lấn thời gian.
 
@@ -116,12 +117,22 @@ def assign_words(
     chữ dài 0 → turn gần nhất chỉ khi cách ≤ `zero_len_gap` s; dấu câu nhận speaker của chữ trước;
     thêm `overlap_frac` (phần thời lượng chữ nằm trong vùng nói chồng). Không bao giờ mặc định S1.
 
+    Luật "chữ mép" (`edge_collar`, None = tắt, đúng nguyên văn ngưỡng 0,5): WhisperX hay kéo dài
+    chữ cuối câu vào khoảng lặng (đo trên vd-run1: trung vị 0,12 s/chữ nhưng có chữ 1–3 s) nên
+    tỉ lệ < 0,5 dù chỉ MỘT giọng phủ chữ đó. Chỉ gán khi: đúng một speaker chồng lấn chữ VÀ không
+    có turn nào của speaker khác trong ±`edge_collar` s quanh chữ (kể cả trong `turns` có chồng).
+    Chữ ở ranh giới hai người vẫn là `None`. Chữ được gán kiểu này có `reasons: ["edge"]`.
+
     Trả bản sao từng word + `speaker`, `ratio`, `overlap_frac`, `reasons`.
     """
     base = list(exclusive_turns) if exclusive_turns else list(turns)
     bs = np.array([float(t["start"]) for t in base], dtype=float)
     be = np.array([float(t["end"]) for t in base], dtype=float)
     bspk = [str(t["speaker"]) for t in base]
+    allt = list(base) + [t for t in turns if exclusive_turns]
+    as_ = np.array([float(t["start"]) for t in allt], dtype=float)
+    ae = np.array([float(t["end"]) for t in allt], dtype=float)
+    aspk = np.array([str(t["speaker"]) for t in allt], dtype=object)
     ov = list(overlaps or [])
     os_ = np.array([float(o["start"]) for o in ov], dtype=float)
     oe = np.array([float(o["end"]) for o in ov], dtype=float)
@@ -164,6 +175,10 @@ def assign_words(
                     ratio = min(1.0, per[best] / dur)
                     if ratio >= min_ratio:
                         speaker = best
+                    elif edge_collar is not None and len(per) == 1 and not bool(np.any(
+                            (aspk != best) & (as_ < we + edge_collar) & (ae > ws - edge_collar))):
+                        speaker = best
+                        d["reasons"].append("edge")
                     else:
                         d["reasons"].append("low_ratio")
                 else:
@@ -178,9 +193,48 @@ def assign_words(
         else:
             ofrac = 0.0
         d["speaker"], d["ratio"], d["overlap_frac"] = speaker, round(ratio, 4), round(min(1.0, ofrac), 4)
+        d["_per"] = per if dur > 0 and len(base) else {}
         prev_spk, prev_ov = speaker, d["overlap_frac"]
         out.append(d)
+    if edge_collar is not None:
+        _punct_boundaries(out, bs, be, bspk)
+    for d in out:
+        d.pop("_per", None)
+    _repropagate_punct(out)
     return out
+
+
+def _punct_boundaries(out: list[dict], bs, be, bspk, max_gap: float = 0.1) -> None:
+    """Pass 2 của luật "chữ mép": chữ `None` nằm ngay sau dấu câu (hoặc đầu bài) thì thuộc mệnh
+    đề PHÍA SAU; nằm ngay trước dấu câu (hoặc cuối bài) thì thuộc mệnh đề PHÍA TRƯỚC — tiếng Trung
+    đổi người nói gần như luôn ở dấu câu. Chỉ gán khi chữ có chồng lấn với turn của speaker đó
+    (hoặc cách ≤ `max_gap` s). Chữ kẹp giữa hai dấu câu → vẫn `None`. Chỉ dùng nhãn của pass 1
+    (không lan dây chuyền)."""
+    labels = [d["speaker"] for d in out]
+    n = len(out)
+    for i, d in enumerate(out):
+        if d["punct"] or labels[i] is not None:
+            continue
+        before_p = i == 0 or out[i - 1]["punct"]
+        after_p = i == n - 1 or out[i + 1]["punct"]
+        if before_p == after_p:
+            continue
+        j = i + 1 if before_p else i - 1
+        if not (0 <= j < n) or out[j]["punct"] or labels[j] is None:
+            continue
+        cand = labels[j]
+        per = d.get("_per") or {}
+        if per and max(per, key=lambda k: per[k]) != cand:
+            continue
+        ok = per.get(cand, 0.0) > 0
+        if not ok and len(bs):
+            ws, we = float(d["start"]), float(d["end"])
+            mask = np.array([k == cand for k in bspk])
+            gaps = np.maximum(bs[mask] - we, ws - be[mask]) if mask.any() else np.array([np.inf])
+            ok = float(gaps.min()) <= max_gap
+        if ok:
+            d["speaker"] = cand
+            d["reasons"] = [r for r in d["reasons"] if r not in ("low_ratio", "no_turn")] + ["edge"]
 
 
 def _repropagate_punct(words: list[dict]) -> None:
@@ -254,6 +308,7 @@ class CertainRule(NamedTuple):
     min_dur: float = 0.6
     allow_smoothed: bool = False
     min_purity: float = 0.0
+    allow_edge: bool = True
 
 
 def is_certain(seg: dict, rule: CertainRule = CertainRule()) -> bool:
@@ -264,6 +319,7 @@ def is_certain(seg: dict, rule: CertainRule = CertainRule()) -> bool:
         and float(seg["end"]) - float(seg["start"]) >= rule.min_dur
         and (rule.allow_smoothed or "smoothed" not in (seg.get("reasons") or []))
         and float(seg.get("purity", 0.0)) >= rule.min_purity
+        and (rule.allow_edge or "edge" not in (seg.get("reasons") or []))
     )
 
 
@@ -339,7 +395,10 @@ def build_segments(
 
     purity   = thời lượng `turns` của speaker đoạn trong [start, end] / tổng thời lượng mọi turn
                trong khoảng đó (không có `turns` → 1,0 nếu có speaker).
-    coverage = thời lượng chữ có nhãn trực tiếp (không tính chữ được làm mượt) / độ dài đoạn.
+    coverage = thời lượng chữ có nhãn trực tiếp (không tính chữ được làm mượt) / tổng thời lượng
+               chữ của đoạn. Không chia cho [start, end]: WhisperX gán cả thời lượng cho dòng dấu
+               câu nên mẫu số theo khung thời gian bị phồng (đo trên vd-run1: câu gán đủ chữ vẫn
+               chỉ đạt ~0,75).
     """
     ts = np.array([float(t["start"]) for t in turns or []], dtype=float)
     te = np.array([float(t["end"]) for t in turns or []], dtype=float)
@@ -356,10 +415,11 @@ def build_segments(
         reasons: list[str] = []
         smoothed = any("smoothed" in (w.get("reasons") or []) for w in nonp)
         labeled = sum(_dur(w) for w in nonp if w["speaker"] is not None and "smoothed" not in (w.get("reasons") or []))
+        word_time = sum(_dur(w) for w in nonp)
         if speaker is None:
             coverage = 0.0
-        elif dur > 0:
-            coverage = min(1.0, labeled / dur)
+        elif word_time > 0:
+            coverage = min(1.0, labeled / word_time)
         else:
             coverage = 0.0 if smoothed else 1.0
         wd = [max(_dur(w), 1e-3) for w in nonp]
@@ -388,6 +448,8 @@ def build_segments(
             reasons.append("short")
         if smoothed:
             reasons.append("smoothed")
+        if any("edge" in (w.get("reasons") or []) for w in nonp):
+            reasons.append("edge")      # thông tin — không chặn "chắc" trừ khi rule.allow_edge=False
 
         if speaker is None:
             status = "no_turn"

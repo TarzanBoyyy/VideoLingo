@@ -45,10 +45,56 @@ class AssignWordsTest(unittest.TestCase):
         self.assertTrue(all(w["speaker"] is None for w in out))
 
     def test_low_overlap_ratio_is_none(self):
-        # chữ 1.0–1.2, turn chỉ phủ 0.05 s (25 %) → dưới ngưỡng 0,5
-        out = sp.assign_words([W("好", 1.0, 1.2)], [T(0.0, 1.05, "S1")])
+        # chữ 1.0–1.2, turn chỉ phủ 0.05 s (25 %) → dưới ngưỡng 0,5 (tắt luật mép)
+        out = sp.assign_words([W("好", 1.0, 1.2)], [T(0.0, 1.05, "S1")], edge_collar=None)
         self.assertIsNone(out[0]["speaker"])
         self.assertIn("low_ratio", out[0]["reasons"])
+        # bật luật mép nhưng có người khác sát bên → vẫn None
+        out = sp.assign_words([W("好", 1.0, 1.2)], [T(0.0, 1.05, "S1"), T(1.35, 2.0, "S2")])
+        self.assertIsNone(out[0]["speaker"])
+
+    def test_stretched_edge_word_with_single_speaker_is_assigned_as_edge(self):
+        # chữ cuối câu bị kéo dài 1,1 s vào khoảng lặng, chỉ S1 phủ 0,3 s → gán S1 ("edge")
+        words = [W("我", 0.0, 0.2), W("是", 0.2, 1.3)]
+        turns = [T(0.0, 0.5, "S1"), T(3.0, 4.0, "S2")]
+        out = sp.assign_words(words, turns)
+        self.assertEqual(out[1]["speaker"], "S1")
+        self.assertIn("edge", out[1]["reasons"])
+        strict = sp.assign_words(words, turns, edge_collar=None)      # đúng nguyên văn ngưỡng 0,5
+        self.assertIsNone(strict[1]["speaker"])
+
+    def test_boundary_word_near_another_speaker_stays_none(self):
+        # chữ ở ranh giới: S2 bắt đầu trong chữ, S1 vừa kết thúc sát trước → mơ hồ → None
+        out = sp.assign_words([W("你", 1.0, 1.1)], [T(0.0, 0.98, "S1"), T(1.07, 3.0, "S2")])
+        self.assertIsNone(out[0]["speaker"])
+        self.assertIn("low_ratio", out[0]["reasons"])
+
+    def test_boundary_word_after_comma_joins_following_clause(self):
+        # "…他，[你]跟着…": "你" sau dấu phẩy, S2 bắt đầu giữa chữ → theo mệnh đề sau (S2)
+        words = [W("他", 0.5, 0.95), W("，", 0.95, 1.0), W("你", 1.0, 1.1), W("跟", 1.1, 1.3), W("着", 1.3, 1.5)]
+        out = sp.assign_words(words, [T(0.0, 0.98, "S1"), T(1.07, 3.0, "S2")])
+        self.assertEqual([w["speaker"] for w in out], ["S1", "S1", "S2", "S2", "S2"])
+        self.assertIn("edge", out[2]["reasons"])
+        strict = sp.assign_words(words, [T(0.0, 0.98, "S1"), T(1.07, 3.0, "S2")], edge_collar=None)
+        self.assertIsNone(strict[2]["speaker"])
+
+    def test_word_between_two_punctuations_stays_none(self):
+        words = [W("他", 0.5, 0.95), W("，", 0.95, 1.0), W("你", 1.0, 1.1), W("。", 1.1, 1.1), W("跟", 1.2, 1.4)]
+        out = sp.assign_words(words, [T(0.0, 0.98, "S1"), T(1.07, 3.0, "S2")])
+        self.assertIsNone(out[2]["speaker"])
+
+    def test_coverage_ignores_time_given_to_punctuation_rows(self):
+        words = [W("你", 0.0, 0.2), W("，", 0.2, 0.6), W("好", 0.6, 0.8)]
+        seg = sp.build_segments(sp.assign_words(words, [T(0.0, 1.0, "S1")]), [T(0.0, 1.0, "S1")])[0]
+        self.assertEqual(seg["coverage"], 1.0)
+
+    def test_edge_segment_can_be_excluded_from_certain(self):
+        words = chars("我是警察", 0.0, 0.3)
+        words[-1] = W("察", 0.9, 2.2)
+        turns = [T(0.0, 1.3, "S1")]
+        seg = sp.build_segments(sp.assign_words(words, turns), turns)[0]
+        self.assertIn("edge", seg["reasons"])
+        self.assertFalse(sp.is_certain(seg, sp.CertainRule(allow_edge=False)))
 
     def test_picks_speaker_with_largest_overlap(self):
         out = sp.assign_words([W("好", 1.0, 1.4)], [T(0.0, 1.1, "S1"), T(1.1, 2.0, "S2")])
