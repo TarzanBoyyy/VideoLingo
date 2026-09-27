@@ -616,6 +616,69 @@ def merge_suggestions(embeddings: dict[str, "np.ndarray | Sequence[float]"], thr
     return sorted(out, key=lambda x: -x["cosine"])
 
 
+# --------------------------------------------------------------------------- trọng tài (docs mục 6.7 T4)
+
+JUDGE_MIN_CONF = 0.8
+_VISION_SPECIAL = {"offscreen", "other_visible", "multiple"}
+
+
+def resolve_judged(
+    seg: dict,
+    flag: dict,
+    text: dict | None,
+    vision: dict | None,
+    *,
+    labels: Iterable[str],
+    close_pairs: Iterable[Iterable[str]] = (),
+    min_conf: float = JUDGE_MIN_CONF,
+) -> dict:
+    """Quyết định cuối của một đoạn từ máy (`seg`, `flag` của flags.py), LLM chữ (`text`) và VLM
+    (`vision["final"]`). Không bao giờ để LLM hoặc VLM một mình gán giọng.
+
+    - Không cờ → máy quyết (`source="machine"`).
+    - Có cờ → tự động (`source="judge"`) CHỈ KHI LLM và VLM cùng một nhãn giọng, VLM conf ≥
+      `min_conf`, và nhãn đó hợp lý về âm thanh: là nhãn máy, nhãn một arm bỏ phiếu, cùng cặp giọng
+      dễ lẫn với nhãn máy (`close_pairs`), hoặc máy không có nhãn.
+    - Còn lại → người duyệt (`source="review"`, `speaker` giữ nhãn máy để hiển thị, `certain=False`)
+      kèm `suggestion` / `split_at` và mã lý do `why`.
+    """
+    labels = set(labels)
+    machine = seg.get("speaker")
+    if not flag.get("flag"):
+        return {"speaker": machine, "certain": bool(seg.get("certain")), "source": "machine",
+                "suggestion": None, "split_at": None, "why": []}
+    pairs = {frozenset(p) for p in close_pairs}
+    t_lab = (text or {}).get("label")
+    v = (vision or {}).get("final") or {}
+    v_lab, v_conf = v.get("speaker"), float(v.get("confidence") or 0.0)
+    why: list[str] = []
+    split_at = None
+    if not text or not vision:
+        why.append("no_judge")
+    if v_lab == "multiple" or t_lab == "MULTI":
+        why.append("multiple")
+        split_at = v.get("split_at") if v_lab == "multiple" else None
+    if t_lab == "NEW":
+        why.append("llm_new")
+    if v_lab in ("offscreen", "other_visible"):
+        why.append("vlm_" + v_lab)
+    if t_lab in labels and v_lab in labels and t_lab != v_lab:
+        why.append("disagree")
+    agree = t_lab in labels and t_lab == v_lab
+    if agree and v_conf < min_conf:
+        why.append("vlm_low_conf")
+    plausible = agree and (machine is None or t_lab == machine or t_lab in (flag.get("voters") or {}).values()
+                           or frozenset((machine, t_lab)) in pairs)
+    if agree and not plausible:
+        why.append("implausible")
+    if agree and plausible and v_conf >= min_conf and not why:
+        return {"speaker": t_lab, "certain": True, "source": "judge", "suggestion": None, "split_at": None,
+                "why": ["llm_vlm_agree"] + (["changed"] if t_lab != machine else [])}
+    suggestion = v_lab if v_lab in labels else (t_lab if t_lab in labels else None)
+    return {"speaker": machine, "certain": False, "source": "review", "suggestion": suggestion,
+            "split_at": split_at, "why": why or ["vlm_low_conf"]}
+
+
 # --------------------------------------------------------------------------- IO
 
 

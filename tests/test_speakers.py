@@ -268,5 +268,67 @@ class TurnsTest(unittest.TestCase):
         self.assertEqual(got, [{"start": 1, "end": 2.5, "speakers": ["S1", "S2"]}])
 
 
+class ResolveJudgedTest(unittest.TestCase):
+    LABELS = ["S1", "S2", "S3", "S4"]
+
+    def seg(self, speaker="S2", certain=True):
+        return {"id": "seg_0001", "speaker": speaker, "certain": certain}
+
+    def flag(self, flagged=True, voters=None):
+        return {"flag": flagged, "voters": voters or {"3dspeaker": "S2", "sherpa-eres2netv2": "S2"}}
+
+    @staticmethod
+    def vis(speaker, conf=0.9, split_at=None):
+        return {"final": {"speaker": speaker, "confidence": conf, "split_at": split_at}}
+
+    def resolve(self, seg, flag, text, vision, **kw):
+        return sp.resolve_judged(seg, flag, text, vision, labels=self.LABELS, **kw)
+
+    def test_unflagged_segment_is_decided_by_machine_without_judge(self):
+        got = self.resolve(self.seg(), self.flag(False), None, None)
+        self.assertEqual((got["speaker"], got["certain"], got["source"]), ("S2", True, "machine"))
+
+    def test_llm_and_vlm_agree_confidently_resolves_flagged_segment(self):
+        got = self.resolve(self.seg("S2", certain=False), self.flag(), {"label": "S2"}, self.vis("S2"))
+        self.assertEqual((got["speaker"], got["certain"], got["source"]), ("S2", True, "judge"))
+        self.assertEqual(got["why"], ["llm_vlm_agree"])
+
+    def test_agreement_can_change_label_only_to_an_acoustically_plausible_voice(self):
+        close = [("S2", "S4")]
+        got = self.resolve(self.seg("S2"), self.flag(), {"label": "S4"}, self.vis("S4"), close_pairs=close)
+        self.assertEqual((got["speaker"], got["source"], got["why"]), ("S4", "judge", ["llm_vlm_agree", "changed"]))
+        # S3 không phải nhãn máy, không phải arm bỏ phiếu, không cùng cặp giọng → người duyệt
+        got = self.resolve(self.seg("S2"), self.flag(), {"label": "S3"}, self.vis("S3"), close_pairs=close)
+        self.assertEqual((got["source"], got["certain"], got["speaker"]), ("review", False, "S2"))
+        self.assertIn("implausible", got["why"])
+        # arm bỏ phiếu nói S3 → hợp lý
+        got = self.resolve(self.seg("S2"), self.flag(voters={"3dspeaker": "S3"}), {"label": "S3"}, self.vis("S3"))
+        self.assertEqual((got["speaker"], got["source"]), ("S3", "judge"))
+
+    def test_single_source_never_assigns(self):
+        for text, vision in (({"label": "S2"}, None), (None, self.vis("S2")), ({"label": "S2"}, self.vis("S4"))):
+            got = self.resolve(self.seg("S2", certain=False), self.flag(), text, vision)
+            self.assertEqual(got["source"], "review")
+            self.assertFalse(got["certain"])
+
+    def test_low_vision_confidence_goes_to_review_with_suggestion(self):
+        got = self.resolve(self.seg("S2"), self.flag(), {"label": "S2"}, self.vis("S2", conf=0.6))
+        self.assertEqual((got["source"], got["suggestion"], got["why"]), ("review", "S2", ["vlm_low_conf"]))
+
+    def test_multiple_speakers_suggests_split(self):
+        got = self.resolve(self.seg("S4"), self.flag(), {"label": "S4"}, self.vis("multiple", split_at=277.2))
+        self.assertEqual((got["source"], got["split_at"]), ("review", 277.2))
+        self.assertIn("multiple", got["why"])
+
+    def test_new_character_and_offscreen_go_to_review(self):
+        got = self.resolve(self.seg("S1"), self.flag(), {"label": "NEW"}, self.vis("offscreen"))
+        self.assertEqual(got["source"], "review")
+        self.assertEqual(set(got["why"]), {"llm_new", "vlm_offscreen"})
+
+    def test_machine_without_label_accepts_agreement(self):
+        got = self.resolve(self.seg(None, certain=False), self.flag(voters={}), {"label": "S3"}, self.vis("S3", 0.85))
+        self.assertEqual((got["speaker"], got["certain"], got["source"]), ("S3", True, "judge"))
+
+
 if __name__ == "__main__":
     unittest.main()
