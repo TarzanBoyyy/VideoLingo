@@ -428,6 +428,40 @@ class ResolveJudgedTest(unittest.TestCase):
         self.assertIn("face_split", got["why"])
         self.assertEqual([p["speaker"] for p in got["parts"]], ["S2", "S4"])
 
+    # --- chỗ cắt theo dòng phụ đề (subcuts.py, thí nghiệm E5) ---------------------------------------
+
+    @staticmethod
+    def sub(*spec):
+        return {"cuts": [w0 for w0, _ in spec[1:]],
+                "parts": [{"w0": w0, "speaker": spk, "start": 10.0 + w0 * 0.1} for w0, spk in spec]}
+
+    def test_subtitle_cut_sends_decided_segment_to_review_with_line_parts(self):
+        sub = self.sub((0, "S4"), (6, "S2"))
+        got = self.resolve(self.seg("S2"), self.flag(False), None, None, subcuts=sub)
+        self.assertEqual((got["source"], got["certain"], got["speaker"], got["why"]), ("review", False, "S2", ["subtitle_cut"]))
+        self.assertEqual(([p["speaker"] for p in got["parts"]], got["split_at"]), (["S4", "S2"], 10.6))
+        got = self.resolve(self.seg("S2", certain=False), self.flag(), {"label": "S2"}, self.vis("S2"), subcuts=sub)
+        self.assertEqual((got["source"], got["why"]), ("review", ["subtitle_cut"]))
+        # đoạn đi duyệt → gợi ý theo dòng, kể cả khi đã có gợi ý một nguồn (ở đây: cách chia của MẶT)
+        got = self.resolve(self.seg("S2"), self.flag(), {"label": "S3"}, self.vis("S4"), subcuts=sub)
+        self.assertEqual(got["source"], "review")
+        self.assertIn("subtitle_split", got["why"])
+        fp = self.fparts((0, "S2", 7), (8, "S4", 4))
+        got = self.resolve(self.seg("S2"), self.flag(), {"label": "S4"}, self.vis("S2", conf=0.6), face=self.face(parts=fp),
+                           subcuts=sub)
+        self.assertEqual(([p["w0"] for p in got["parts"]], got["why"][-1]), ([0, 6], "subtitle_split"))
+        # không có chỗ cắt / một phần → không đổi gì
+        for s in (None, {"cuts": [], "parts": [{"w0": 0, "speaker": "S2"}]}):
+            self.assertEqual(self.resolve(self.seg("S2"), self.flag(False), None, None, subcuts=s)["source"], "machine")
+
+    def test_subtitle_cut_keeps_split_decided_by_llm_and_vision(self):
+        parts = self.parts((0, "S2", None), (9, "S4", None))
+        flag = dict(self.flag(), inner_speakers=["S2", "S4"])
+        got = self.resolve(self.seg("S2"), flag, {"label": "MULTI", "parts": parts},
+                           self.split_vis((0, "S2", 0.9), (9, "S4", 0.9)), subcuts=self.sub((0, "S2"), (4, "S4")))
+        self.assertEqual((got["source"], len(got["parts"])), ("judge", 2))
+        self.assertEqual(got["parts"][1]["w0"], 9)
+
 
 if __name__ == "__main__":
     unittest.main()

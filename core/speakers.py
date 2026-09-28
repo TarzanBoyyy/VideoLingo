@@ -665,6 +665,39 @@ def resolve_judged(
     split_tol: int = JUDGE_SPLIT_TOL,
     face: dict | None = None,
     face_min_conf: float = FACE_MIN_CONF,
+    subcuts: dict | None = None,
+) -> dict:
+    """`_resolve_with_face` (máy + LLM + VLM + phiếu MẶT), thêm chỗ cắt theo dòng phụ đề (`subcuts`, thí nghiệm E5 —
+    tools/speaker_bench/subcuts.py: ở một chỗ đổi dòng ≥ 2 nguồn độc lập (hình, giọng từng dòng, LLM đọc kịch bản) thấy
+    đổi người, không nguồn nào nói cùng người). Chỉ làm đoạn THẬN TRỌNG hơn, không bao giờ tự gán:
+    - đoạn đã quyết một giọng (máy / trọng tài, không chia phần) → người duyệt (`subtitle_cut`), gợi ý các phần theo dòng;
+    - đoạn đi duyệt → gợi ý các phần theo dòng (`subtitle_split`) thay cho gợi ý một nguồn (MẶT / LLM / VLM riêng lẻ);
+    - đoạn trọng tài đã tự tách (LLM và VLM chia giống nhau) → giữ nguyên."""
+    r = _resolve_with_face(seg, flag, text, vision, labels=labels, close_pairs=close_pairs, min_conf=min_conf,
+                           split_tol=split_tol, face=face, face_min_conf=face_min_conf)
+    sub = [dict(p) for p in (subcuts or {}).get("parts") or []]
+    if len(sub) < 2 or (r["certain"] and r.get("parts")):
+        return r
+    split = {"parts": sub, "split_at": sub[1].get("start")}
+    if r["certain"]:
+        return {"speaker": seg.get("speaker"), "certain": False, "source": "review",
+                "suggestion": r.get("suggestion") or r.get("speaker"), **split,
+                "why": [w for w in r.get("why") or [] if w not in ("llm_vlm_agree", "changed", "split")] + ["subtitle_cut"]}
+    return {**r, **split, "why": (r.get("why") or []) + ["subtitle_split"]}
+
+
+def _resolve_with_face(
+    seg: dict,
+    flag: dict,
+    text: dict | None,
+    vision: dict | None,
+    *,
+    labels: Iterable[str],
+    close_pairs: Iterable[Iterable[str]] = (),
+    min_conf: float = JUDGE_MIN_CONF,
+    split_tol: int = JUDGE_SPLIT_TOL,
+    face: dict | None = None,
+    face_min_conf: float = FACE_MIN_CONF,
 ) -> dict:
     """Như `_resolve_text_vision` (máy + LLM + VLM), thêm phiếu MẶT (`face`, faces.py: mặt nào mấp máy đúng
     tiếng theo từng chữ → giọng qua bảng mặt ↔ giọng học từ đoạn máy tự quyết). MẶT không bao giờ gán một mình:
