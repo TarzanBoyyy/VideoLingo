@@ -329,6 +329,46 @@ class ResolveJudgedTest(unittest.TestCase):
         got = self.resolve(self.seg(None, certain=False), self.flag(voters={}), {"label": "S3"}, self.vis("S3", 0.85))
         self.assertEqual((got["speaker"], got["certain"], got["source"]), ("S3", True, "judge"))
 
+    # --- đoạn nhiều người (mục 6.8b): phần đã khớp vào ranh giới chữ ---------------------------------
+
+    @staticmethod
+    def parts(*spec):
+        return [{"w0": w0, "speaker": spk, "confidence": conf, "start": 10.0 + w0 * 0.1} for w0, spk, conf in spec]
+
+    def split_vis(self, *spec):
+        return {"final": {"speaker": "multiple", "confidence": min(c for _, _, c in spec), "parts": self.parts(*spec)}}
+
+    def test_same_split_from_llm_and_vlm_is_decided_automatically(self):
+        flag = dict(self.flag(), inner_speakers=["S3", "S4"])
+        text = {"label": "MULTI", "parts": self.parts((0, "S3", None), (8, "S4", None))}
+        got = self.resolve(self.seg("S3"), flag, text, self.split_vis((0, "S3", 0.9), (9, "S4", 0.85)))
+        self.assertEqual((got["source"], got["certain"], got["speaker"], got["why"]), ("judge", True, "S3", ["llm_vlm_agree", "split"]))
+        self.assertEqual([(p["w0"], p["speaker"]) for p in got["parts"]], [(0, "S3"), (9, "S4")])
+
+    def test_split_needs_both_sources_same_cut_same_voices_and_confidence(self):
+        flag = dict(self.flag(), inner_speakers=["S3", "S4"])
+        v = self.split_vis((0, "S3", 0.9), (9, "S4", 0.9))
+        cases = [
+            ({"label": "S3", "parts": self.parts((0, "S3", None))}, v, "split_disagree"),             # LLM: một người
+            ({"parts": self.parts((0, "S3", None), (4, "S4", None))}, v, "split_disagree"),          # cắt lệch 5 chữ
+            ({"parts": self.parts((0, "S3", None), (9, "S2", None))}, v, "split_disagree"),          # khác giọng
+            ({"parts": self.parts((0, "S3", None), (9, "S4", None))}, self.split_vis((0, "S3", 0.9), (9, "S4", 0.6)), "vlm_low_conf"),
+            ({"parts": self.parts((0, "S3", None), (9, "S1", None))}, self.split_vis((0, "S3", 0.9), (9, "S1", 0.9)), "implausible"),
+        ]
+        for text, vision, reason in cases:
+            got = self.resolve(self.seg("S3"), flag, text, vision)
+            self.assertEqual((got["source"], got["certain"], got["speaker"]), ("review", False, "S3"), reason)
+            self.assertIn(reason, got["why"])
+            self.assertEqual(len(got["parts"]), 2)          # gợi ý tách cho người duyệt
+        # chỉ LLM tách → gợi ý là cách chia của LLM
+        got = self.resolve(self.seg("S3"), flag, {"parts": self.parts((0, "S3", None), (9, "S4", None))}, self.vis("S3"))
+        self.assertEqual((got["source"], got["split_at"]), ("review", 10.9))
+
+    def test_voice_heard_inside_segment_makes_single_label_plausible(self):
+        flag = dict(self.flag(voters={"3dspeaker": "S2"}), inner_speakers=["S2", "S1"])
+        got = self.resolve(self.seg("S2"), flag, {"label": "S1"}, self.vis("S1"))
+        self.assertEqual((got["speaker"], got["source"]), ("S1", "judge"))
+
 
 if __name__ == "__main__":
     unittest.main()

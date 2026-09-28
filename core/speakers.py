@@ -619,7 +619,15 @@ def merge_suggestions(embeddings: dict[str, "np.ndarray | Sequence[float]"], thr
 # --------------------------------------------------------------------------- trọng tài (docs mục 6.7 T4)
 
 JUDGE_MIN_CONF = 0.8
+JUDGE_SPLIT_TOL = 2          # điểm cắt của LLM và VLM lệch ≤ 2 chữ (chỉ số chữ) thì coi là cùng một chỗ
 _VISION_SPECIAL = {"offscreen", "other_visible", "multiple"}
+
+
+def _same_split(a: list[dict], b: list[dict], labels: set[str], tol: int) -> bool:
+    """Hai cách chia cùng số phần, cùng giọng từng phần (giọng có thật), điểm cắt lệch ≤ `tol` chữ."""
+    return (len(a) == len(b) >= 2
+            and all(x.get("speaker") == y.get("speaker") and x.get("speaker") in labels for x, y in zip(a, b))
+            and all(abs(int(x["w0"]) - int(y["w0"])) <= tol for x, y in zip(a[1:], b[1:])))
 
 
 def resolve_judged(
@@ -631,30 +639,61 @@ def resolve_judged(
     labels: Iterable[str],
     close_pairs: Iterable[Iterable[str]] = (),
     min_conf: float = JUDGE_MIN_CONF,
+    split_tol: int = JUDGE_SPLIT_TOL,
 ) -> dict:
     """Quyết định cuối của một đoạn từ máy (`seg`, `flag` của flags.py), LLM chữ (`text`) và VLM
     (`vision["final"]`). Không bao giờ để LLM hoặc VLM một mình gán giọng.
 
     - Không cờ → máy quyết (`source="machine"`).
     - Có cờ → tự động (`source="judge"`) CHỈ KHI LLM và VLM cùng một nhãn giọng, VLM conf ≥
-      `min_conf`, và nhãn đó hợp lý về âm thanh: là nhãn máy, nhãn một arm bỏ phiếu, cùng cặp giọng
-      dễ lẫn với nhãn máy (`close_pairs`), hoặc máy không có nhãn.
+      `min_conf`, và nhãn đó hợp lý về âm thanh: là nhãn máy, nhãn một arm bỏ phiếu, giọng arm chính
+      nghe thấy bên trong đoạn (`flag["inner_speakers"]`), cùng cặp giọng dễ lẫn với nhãn máy
+      (`close_pairs`), hoặc máy không có nhãn.
+    - Đoạn nhiều người (mục 6.8b): `text["parts"]` / `vision["final"]["parts"]` là các phần đã khớp vào
+      ranh giới chữ (`{w0, speaker, confidence, …}`). Tự động tách (`parts` trong kết quả) CHỈ KHI cả hai
+      nguồn chia giống nhau (`_same_split`), mọi phần VLM conf ≥ `min_conf` và mọi giọng hợp lý như trên.
     - Còn lại → người duyệt (`source="review"`, `speaker` giữ nhãn máy để hiển thị, `certain=False`)
-      kèm `suggestion` / `split_at` và mã lý do `why`.
+      kèm `suggestion` / `parts` gợi ý / `split_at` và mã lý do `why`.
     """
     labels = set(labels)
     machine = seg.get("speaker")
     if not flag.get("flag"):
         return {"speaker": machine, "certain": bool(seg.get("certain")), "source": "machine",
-                "suggestion": None, "split_at": None, "why": []}
+                "suggestion": None, "split_at": None, "parts": None, "why": []}
     pairs = {frozenset(p) for p in close_pairs}
+    heard = set((flag.get("voters") or {}).values()) | set(flag.get("inner_speakers") or [])
+
+    def plausible(spk: str | None) -> bool:
+        return machine is None or spk == machine or spk in heard or frozenset((machine, spk)) in pairs
+
     t_lab = (text or {}).get("label")
     v = (vision or {}).get("final") or {}
     v_lab, v_conf = v.get("speaker"), float(v.get("confidence") or 0.0)
+    t_parts = list((text or {}).get("parts") or [])
+    v_parts = list(v.get("parts") or [])
     why: list[str] = []
-    split_at = None
     if not text or not vision:
         why.append("no_judge")
+
+    if len(t_parts) >= 2 or len(v_parts) >= 2:
+        why.append("multiple")
+        agree = _same_split(t_parts, v_parts, labels, split_tol)
+        conf_ok = agree and min(float(p.get("confidence") or 0.0) for p in v_parts) >= min_conf
+        if not agree:
+            why.append("split_disagree")
+        elif not conf_ok:
+            why.append("vlm_low_conf")
+        elif not all(plausible(p["speaker"]) for p in v_parts):
+            why.append("implausible")
+        if agree and conf_ok and why == ["multiple"]:
+            first = v_parts[0]["speaker"]
+            return {"speaker": first, "certain": True, "source": "judge", "suggestion": None, "split_at": None,
+                    "parts": v_parts, "why": ["llm_vlm_agree", "split"]}
+        sug = v_parts if len(v_parts) >= 2 else t_parts
+        return {"speaker": machine, "certain": False, "source": "review", "suggestion": None,
+                "split_at": sug[1].get("start") if len(sug) >= 2 else None, "parts": sug, "why": why}
+
+    split_at = None
     if v_lab == "multiple" or t_lab == "MULTI":
         why.append("multiple")
         split_at = v.get("split_at") if v_lab == "multiple" else None
@@ -667,16 +706,14 @@ def resolve_judged(
     agree = t_lab in labels and t_lab == v_lab
     if agree and v_conf < min_conf:
         why.append("vlm_low_conf")
-    plausible = agree and (machine is None or t_lab == machine or t_lab in (flag.get("voters") or {}).values()
-                           or frozenset((machine, t_lab)) in pairs)
-    if agree and not plausible:
+    if agree and not plausible(t_lab):
         why.append("implausible")
-    if agree and plausible and v_conf >= min_conf and not why:
+    if agree and v_conf >= min_conf and not why:
         return {"speaker": t_lab, "certain": True, "source": "judge", "suggestion": None, "split_at": None,
-                "why": ["llm_vlm_agree"] + (["changed"] if t_lab != machine else [])}
+                "parts": None, "why": ["llm_vlm_agree"] + (["changed"] if t_lab != machine else [])}
     suggestion = v_lab if v_lab in labels else (t_lab if t_lab in labels else None)
     return {"speaker": machine, "certain": False, "source": "review", "suggestion": suggestion,
-            "split_at": split_at, "why": why or ["vlm_low_conf"]}
+            "split_at": split_at, "parts": None, "why": why or ["vlm_low_conf"]}
 
 
 # --------------------------------------------------------------------------- IO
