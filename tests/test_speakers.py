@@ -369,6 +369,65 @@ class ResolveJudgedTest(unittest.TestCase):
         got = self.resolve(self.seg("S2"), flag, {"label": "S1"}, self.vis("S1"))
         self.assertEqual((got["speaker"], got["source"]), ("S1", "judge"))
 
+    # --- phiếu MẶT (faces.py, thí nghiệm E1) ---------------------------------------------------------
+
+    @staticmethod
+    def face(speaker=None, conf=0.9, vote=None, parts=None):
+        return {"vote": vote or ("multiple" if parts else "speaker"), "speaker": speaker, "confidence": conf,
+                "parts": parts}
+
+    @staticmethod
+    def fparts(*spec):
+        return [{"w0": w0, "speaker": spk, "words": n, "start": 10.0 + w0 * 0.1} for w0, spk, n in spec]
+
+    def test_face_without_disagreement_changes_nothing(self):
+        got = self.resolve(self.seg(), self.flag(False), None, None, face=self.face("S2"))
+        self.assertEqual((got["source"], got["speaker"]), ("machine", "S2"))
+        got = self.resolve(self.seg("S2", certain=False), self.flag(), {"label": "S2"}, self.vis("S2"),
+                           face=self.face(None, 1.0, vote="offscreen"))
+        self.assertEqual((got["source"], got["why"]), ("judge", ["llm_vlm_agree"]))
+
+    def test_face_vetoes_machine_and_judge_decisions(self):
+        got = self.resolve(self.seg("S2"), self.flag(False), None, None, face=self.face("S4"))
+        self.assertEqual((got["source"], got["certain"], got["speaker"], got["why"]), ("review", False, "S2", ["face_disagree"]))
+        got = self.resolve(self.seg("S2"), self.flag(), {"label": "S2"}, self.vis("S2"), face=self.face("S4"))
+        self.assertEqual((got["source"], got["suggestion"]), ("review", "S2"))
+        self.assertEqual(got["why"], ["face_veto"])
+        # MẶT chưa đủ tin → không phủ quyết
+        got = self.resolve(self.seg("S2"), self.flag(), {"label": "S2"}, self.vis("S2"), face=self.face("S4", conf=0.3))
+        self.assertEqual(got["source"], "judge")
+
+    def test_face_part_by_another_voice_sends_segment_to_review(self):
+        fp = self.fparts((0, "S2", 5), (6, "NEW_FACE:F5", 7))
+        got = self.resolve(self.seg("S4"), self.flag(), {"label": "S4"}, self.vis("S4"), face=self.face(parts=fp))
+        self.assertEqual((got["source"], got["why"]), ("review", ["face_multiple"]))
+        self.assertIsNone(got["parts"])        # phần "mặt mới" không phải giọng có thật → không gợi ý tách
+        # phần giọng khác quá ngắn, hoặc chỉ là mặt chưa gắn giọng → giữ quyết định
+        for fp in (self.fparts((0, "S2", 2), (3, "S4", 9)), self.fparts((0, "S4", 9), (10, "NEW_FACE:F12", 6))):
+            got = self.resolve(self.seg("S4"), self.flag(False), None, None, face=self.face(parts=fp))
+            self.assertEqual(got["source"], "machine")
+
+    def test_llm_and_face_agreeing_decide_without_vision(self):
+        got = self.resolve(self.seg("S2", certain=False), self.flag(), {"label": "S4"}, None,
+                           face=self.face("S4"), close_pairs=[("S2", "S4")])
+        self.assertEqual((got["source"], got["speaker"], got["why"]), ("judge", "S4", ["llm_face_agree", "changed"]))
+        # VLM đã chạy và nói khác → không đi tắt; phải hợp lý âm thanh; LLM tách → không đi tắt
+        got = self.resolve(self.seg("S2"), self.flag(), {"label": "S4"}, self.vis("S3"), face=self.face("S4"),
+                           close_pairs=[("S2", "S4")])
+        self.assertEqual(got["source"], "review")
+        got = self.resolve(self.seg("S2"), self.flag(), {"label": "S3"}, None, face=self.face("S3"))
+        self.assertEqual(got["source"], "review")
+        text = {"label": "MULTI", "parts": self.parts((0, "S4", None), (5, "S2", None))}
+        got = self.resolve(self.seg("S2"), self.flag(), text, None, face=self.face("S2"))
+        self.assertEqual(got["source"], "review")
+
+    def test_face_split_is_offered_to_reviewer_only_with_real_voices(self):
+        fp = self.fparts((0, "S2", 7), (8, "S4", 4))
+        got = self.resolve(self.seg("S2"), self.flag(), {"label": "S4"}, self.vis("S2", conf=0.6), face=self.face(parts=fp))
+        self.assertEqual((got["source"], got["split_at"]), ("review", 10.8))
+        self.assertIn("face_split", got["why"])
+        self.assertEqual([p["speaker"] for p in got["parts"]], ["S2", "S4"])
+
 
 if __name__ == "__main__":
     unittest.main()

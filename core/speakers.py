@@ -630,7 +630,98 @@ def _same_split(a: list[dict], b: list[dict], labels: set[str], tol: int) -> boo
             and all(abs(int(x["w0"]) - int(y["w0"])) <= tol for x, y in zip(a[1:], b[1:])))
 
 
+FACE_MIN_CONF = 0.5          # phiếu MẶT (tools/speaker_bench/faces.py) "dám phán" một giọng từ mức này
+FACE_PART_MIN_WORDS = 3      # phần theo mặt nói giọng khác phải có ≥ 3 chữ mới đẩy đoạn đi duyệt
+
+
+def _face_voice(face: dict | None, labels: set[str], min_conf: float) -> str | None:
+    """Giọng mà phiếu MẶT phán cho cả đoạn (đủ tin), hoặc None."""
+    if face and face.get("vote") == "speaker" and face.get("speaker") in labels \
+            and float(face.get("confidence") or 0.0) >= min_conf:
+        return face["speaker"]
+    return None
+
+
+def _face_other_voice(face: dict | None, labels: set[str], decided: str | None) -> str | None:
+    """Phiếu MẶT thấy nhiều người và một phần (≥ FACE_PART_MIN_WORDS chữ có mặt đang nói) là giọng có thật
+    KHÁC nhãn đã quyết → giọng đó (đoạn có thể gồm người khác mà LLM/VLM/máy bỏ sót)."""
+    if not face or face.get("vote") != "multiple":
+        return None
+    for p in face.get("parts") or []:
+        if p.get("speaker") in labels and p["speaker"] != decided and int(p.get("words") or 0) >= FACE_PART_MIN_WORDS:
+            return p["speaker"]
+    return None
+
+
 def resolve_judged(
+    seg: dict,
+    flag: dict,
+    text: dict | None,
+    vision: dict | None,
+    *,
+    labels: Iterable[str],
+    close_pairs: Iterable[Iterable[str]] = (),
+    min_conf: float = JUDGE_MIN_CONF,
+    split_tol: int = JUDGE_SPLIT_TOL,
+    face: dict | None = None,
+    face_min_conf: float = FACE_MIN_CONF,
+) -> dict:
+    """Như `_resolve_text_vision` (máy + LLM + VLM), thêm phiếu MẶT (`face`, faces.py: mặt nào mấp máy đúng
+    tiếng theo từng chữ → giọng qua bảng mặt ↔ giọng học từ đoạn máy tự quyết). MẶT không bao giờ gán một mình:
+    - Phủ quyết: đoạn máy/trọng tài đã quyết mà MẶT phán giọng khác (`face_disagree` / `face_veto`), hoặc thấy một
+      phần do giọng khác nói (`face_multiple`) → người duyệt.
+    - LLM = MẶT (một giọng, MẶT conf ≥ `face_min_conf`, hợp lý âm thanh, VLM nếu có không phản đối) → tự động
+      (`llm_face_agree`) — luồng mới không cần gọi VLM cho đoạn này. MẶT và VLM cùng nhìn một cái miệng nên
+      MẶT = VLM không được tính là hai nguồn độc lập.
+    - Đoạn đi duyệt chưa có gợi ý tách: dùng cách chia của MẶT khi mọi phần đều là giọng có thật (`face_split`)."""
+    labels = set(labels)
+    machine = seg.get("speaker")
+    f_voice = _face_voice(face, labels, face_min_conf)
+    f_parts = [p for p in (face or {}).get("parts") or []] if (face or {}).get("vote") == "multiple" else []
+    f_split = f_parts if len(f_parts) >= 2 and all(p.get("speaker") in labels for p in f_parts) else None
+
+    def to_review(r: dict, why: str) -> dict:
+        parts = r.get("parts") if r.get("source") == "review" else None
+        parts = parts or f_split
+        return {"speaker": machine, "certain": False, "source": "review", "suggestion": r.get("suggestion") or r.get("speaker"),
+                "split_at": (parts[1].get("start") if parts else r.get("split_at")), "parts": parts,
+                "why": [w for w in r.get("why") or [] if w not in ("llm_vlm_agree", "changed", "split")] + [why]}
+
+    if not flag.get("flag"):
+        r = _resolve_text_vision(seg, flag, text, vision, labels=labels, close_pairs=close_pairs,
+                                 min_conf=min_conf, split_tol=split_tol)
+        if f_voice and f_voice != machine:
+            return {**to_review(r, "face_disagree"), "suggestion": machine}
+        if _face_other_voice(face, labels, machine):
+            return to_review(r, "face_multiple")
+        return r
+
+    pairs = {frozenset(p) for p in close_pairs}
+    heard = set((flag.get("voters") or {}).values()) | set(flag.get("inner_speakers") or [])
+    t_lab = (text or {}).get("label")
+    t_split = len((text or {}).get("parts") or []) >= 2
+    v = (vision or {}).get("final") or {}
+    v_lab = v.get("speaker")
+    plausible = machine is None or f_voice == machine or f_voice in heard or frozenset((machine, f_voice)) in pairs
+    vlm_objects = bool(vision) and v_lab != f_voice      # đã gọi VLM (luồng cũ) mà VLM nói khác → không đi tắt
+    if f_voice and t_lab == f_voice and not t_split and plausible and not vlm_objects:
+        return {"speaker": f_voice, "certain": True, "source": "judge", "suggestion": None, "split_at": None,
+                "parts": None, "why": ["llm_face_agree"] + (["changed"] if f_voice != machine else [])}
+
+    r = _resolve_text_vision(seg, flag, text, vision, labels=labels, close_pairs=close_pairs,
+                             min_conf=min_conf, split_tol=split_tol)
+    if r["source"] == "judge":
+        if f_voice and not r.get("parts") and f_voice != r["speaker"]:
+            return to_review(r, "face_veto")
+        if not r.get("parts") and _face_other_voice(face, labels, r["speaker"]):
+            return to_review(r, "face_multiple")
+        return r
+    if r["source"] == "review" and not r.get("parts") and f_split:
+        return {**r, "parts": f_split, "split_at": f_split[1].get("start"), "why": r["why"] + ["face_split"]}
+    return r
+
+
+def _resolve_text_vision(
     seg: dict,
     flag: dict,
     text: dict | None,
