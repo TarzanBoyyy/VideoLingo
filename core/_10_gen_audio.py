@@ -14,6 +14,7 @@ from core.utils import *
 from core.utils.models import *
 from core.asr_backend.audio_preprocess import get_audio_duration
 from core.tts_backend.tts_main import tts_main
+from core import dub_script
 
 console = Console()
 
@@ -62,20 +63,39 @@ def adjust_audio_speed(input_file: str, output_file: str, speed_factor: float) -
                 rprint(f"[red]❌ Audio speed adjustment failed, max retries reached ({max_retries})[/red]")
                 raise e
 
-def process_row(row: pd.Series, tasks_df: pd.DataFrame) -> Tuple[int, float]:
-    """Helper function for processing single row data"""
-    number = row['number']
-    lines = eval(row['lines']) if isinstance(row['lines'], str) else row['lines']
+def synth_lines(number, lines, tasks_df: pd.DataFrame, fresh: bool = False) -> float:
+    """TTS từng line của một dòng, trả tổng thời lượng. `fresh` xoá file cũ (tts_main bỏ qua file đã có)."""
     real_dur = 0
     for line_index, line in enumerate(lines):
         temp_file = TEMP_FILE_TEMPLATE.format(f"{number}_{line_index}")
+        if fresh and os.path.exists(temp_file):
+            os.remove(temp_file)
         tts_main(line, temp_file, number, tasks_df)
         real_dur += get_audio_duration(temp_file)
-    return number, real_dur
+    return real_dur
+
+def process_row(row: pd.Series, tasks_df: pd.DataFrame) -> Tuple[int, float, list, int]:
+    """Helper function for processing single row data"""
+    number = row['number']
+    lines = eval(row['lines']) if isinstance(row['lines'], str) else row['lines']
+    real_dur = synth_lines(number, lines, tasks_df)
+    rewrites = 0
+    if dub_script.fit_on():
+        lines, real_dur, rewrites = dub_script.fit_row(
+            row, lines, real_dur, lambda ls: synth_lines(number, ls, tasks_df, fresh=True), tasks_df)
+    return number, real_dur, lines, rewrites
+
+def _store_row(tasks_df: pd.DataFrame, number, real_dur, lines, rewrites) -> None:
+    mask = tasks_df['number'] == number
+    tasks_df.loc[mask, 'real_dur'] = real_dur
+    tasks_df.loc[mask, 'lines'] = str(lines)
+    tasks_df.loc[mask, 'rewrites'] = rewrites
 
 def generate_tts_audio(tasks_df: pd.DataFrame) -> pd.DataFrame:
     """Generate TTS audio sequentially and calculate actual duration"""
     tasks_df['real_dur'] = 0
+    tasks_df['rewrites'] = 0
+    tasks_df['lines'] = tasks_df['lines'].astype(str)
     rprint("[bold green]🎯 Starting TTS audio generation...[/bold green]")
     
     with Progress() as progress:
@@ -86,8 +106,7 @@ def generate_tts_audio(tasks_df: pd.DataFrame) -> pd.DataFrame:
         for _, row in tasks_df.head(warmup_size).iterrows():
             try:
                 check_cancel()
-                number, real_dur = process_row(row, tasks_df)
-                tasks_df.loc[tasks_df['number'] == number, 'real_dur'] = real_dur
+                _store_row(tasks_df, *process_row(row, tasks_df))
                 progress.advance(task)
             except Exception as e:
                 rprint(f"[red]❌ Error in warmup: {str(e)}[/red]")
@@ -108,8 +127,7 @@ def generate_tts_audio(tasks_df: pd.DataFrame) -> pd.DataFrame:
                     for future in as_completed(futures):
                         check_cancel()
                         try:
-                            number, real_dur = future.result()
-                            tasks_df.loc[tasks_df['number'] == number, 'real_dur'] = real_dur
+                            _store_row(tasks_df, *future.result())
                             progress.advance(task)
                         except Exception as e:
                             rprint(f"[red]❌ Error: {str(e)}[/red]")
@@ -153,14 +171,22 @@ def merge_chunks(tasks_df: pd.DataFrame) -> pd.DataFrame:
     accept = load_key("speed_factor.accept")
     min_speed = load_key("speed_factor.min")
     chunk_start = 0
+    fit = dub_script.fit_on()
+    max_speed = float(load_key("dub_fit.max_speed")) if fit else None
     
     tasks_df['new_sub_times'] = None
+    tasks_df['speed'] = 1.0
+    tasks_df['truncated'] = 0.0
     
     for index, row in tasks_df.iterrows():
         if row['cut_off'] == 1:
             check_cancel()
             chunk_df = tasks_df.iloc[chunk_start:index+1].reset_index(drop=True)
             speed_factor, keep_gaps = process_chunk(chunk_df, accept, min_speed)
+            if fit and speed_factor > max_speed:
+                rprint(f"[yellow]⚠️ Chunk {chunk_start} to {index} needs speed {speed_factor}, capped at {max_speed}[/yellow]")
+                speed_factor = max_speed
+            tasks_df.loc[chunk_start:index, 'speed'] = speed_factor
             
             # 🎯 Step1: Start processing new timeline
             chunk_start_time = parse_df_srt_time(chunk_df.iloc[0]['start_time'])
@@ -188,7 +214,25 @@ def merge_chunks(tasks_df: pd.DataFrame) -> pd.DataFrame:
                 emoji = "⚡" if speed_factor <= accept else "⚠️"
                 rprint(f"[cyan]{emoji} Processed chunk {chunk_start} to {index} with speed factor {speed_factor}[/cyan]")
             # 🔄 Step5: Check if the last row exceeds the range
-            if cur_time > chunk_end_time:
+            # dub_fit: tốc độ có trần nên chunk có thể tràn — được lấn vào khoảng lặng còn lại tới
+            # câu kế (gap - tolerance); vẫn tràn thì cắt đuôi + fade thay vì làm hỏng cả job.
+            spare = max(0.0, chunk_df.iloc[-1]['gap'] - chunk_df.iloc[-1]['tolerance']) if fit else 0.0
+            if cur_time > chunk_end_time + spare and fit:
+                time_diff = cur_time - chunk_end_time - spare
+                rprint(f"[yellow]⚠️ Chunk {chunk_start} to {index} still exceeds by {time_diff:.3f}s at max speed, truncating last audio[/yellow]")
+                last_number = tasks_df.iloc[index]['number']
+                last_lines = eval(tasks_df.iloc[index]['lines']) if isinstance(tasks_df.iloc[index]['lines'], str) else tasks_df.iloc[index]['lines']
+                last_file = OUTPUT_FILE_TEMPLATE.format(f"{last_number}_{len(last_lines) - 1}")
+                audio = AudioSegment.from_wav(last_file)
+                keep_ms = max(100, int(len(audio) - time_diff * 1000))
+                audio[:keep_ms].fade_out(min(80, keep_ms // 2)).export(last_file, format="wav")
+                last_times = tasks_df.at[index, 'new_sub_times']
+                last_times[-1][1] = chunk_end_time + spare
+                tasks_df.at[index, 'new_sub_times'] = last_times
+                tasks_df.at[index, 'truncated'] = round(time_diff, 3)
+            elif cur_time > chunk_end_time and fit:
+                rprint(f"[cyan]Chunk {chunk_start} to {index} runs {cur_time - chunk_end_time:.3f}s into the following silence[/cyan]")
+            elif cur_time > chunk_end_time:
                 time_diff = cur_time - chunk_end_time
                 if time_diff <= 0.6:  # If exceeding time is within 0.6 seconds, truncate the last audio
                     rprint(f"[yellow]⚠️ Chunk {chunk_start} to {index} exceeds by {time_diff:.3f}s, truncating last audio[/yellow]")
@@ -233,6 +277,7 @@ def gen_audio() -> None:
     
     # 🔄 Step4: Merge audio chunks
     tasks_df = merge_chunks(tasks_df)
+    dub_script.write_report(tasks_df)
     
     # 💾 Step5: Save results
     tasks_df.to_excel(_8_1_AUDIO_TASK, index=False)

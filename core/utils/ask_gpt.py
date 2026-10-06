@@ -14,26 +14,36 @@ from core.utils.decorator import except_handler
 LOCK = Lock()
 GPT_LOG_FOLDER = 'output/gpt_log'
 
+def _read_logs(file):
+    """File cache hỏng (tiến trình bị kill giữa lúc ghi → rỗng/cụt) thì coi như chưa có cache,
+    không để mọi lần gọi sau nổ JSONDecodeError."""
+    if not os.path.exists(file):
+        return []
+    try:
+        with open(file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        rprint(f"[yellow]⚠️ gpt cache {file} hỏng — bỏ qua[/yellow]")
+        return []
+
 def _save_cache(model, prompt, resp_content, resp_type, resp, message=None, log_title="default"):
     with LOCK:
-        logs = []
         file = os.path.join(GPT_LOG_FOLDER, f"{log_title}.json")
         os.makedirs(os.path.dirname(file), exist_ok=True)
-        if os.path.exists(file):
-            with open(file, 'r', encoding='utf-8') as f:
-                logs = json.load(f)
+        logs = _read_logs(file)
         logs.append({"model": model, "prompt": prompt, "resp_content": resp_content, "resp_type": resp_type, "resp": resp, "message": message})
-        with open(file, 'w', encoding='utf-8') as f:
+        # Ghi file tạm rồi os.replace (atomic) — bị kill giữa chừng không để lại file cụt
+        tmp = f"{file}.tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(logs, f, ensure_ascii=False, indent=4)
+        os.replace(tmp, file)
 
 def _load_cache(prompt, resp_type, log_title):
     with LOCK:
         file = os.path.join(GPT_LOG_FOLDER, f"{log_title}.json")
-        if os.path.exists(file):
-            with open(file, 'r', encoding='utf-8') as f:
-                for item in json.load(f):
-                    if item["prompt"] == prompt and item["resp_type"] == resp_type:
-                        return item["resp"]
+        for item in _read_logs(file):
+            if item["prompt"] == prompt and item["resp_type"] == resp_type:
+                return item["resp"]
         return False
 
 # ------------

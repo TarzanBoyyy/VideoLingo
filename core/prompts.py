@@ -414,3 +414,79 @@ Clean the given text by:
 
 Note: Start you answer with ```json and end with ```, do not add any other text.
 '''.strip()
+
+## ================================================================
+# @ dub_script.py — dịch lời lồng tiếng + chọn sắc thái + vừa ngân sách thời lượng (một lượt)
+def get_dub_script_prompt(items, theme, terms, before, after, styles):
+    tgt = load_key("target_language")
+    items_json = json.dumps(items, ensure_ascii=False, indent=2)
+    terms_json = json.dumps(terms, ensure_ascii=False) if terms else "[]"
+    before_txt = "\n".join(before) or "(none)"
+    after_txt = "\n".join(after) or "(none)"
+    return f'''
+## Role
+You are a dubbing script writer for Chinese drama dubbed into **{tgt}**. Each line you write is read aloud by a TTS voice over the original actor's mouth timing.
+
+## Context
+Video theme: {theme}
+Terminology (keep consistent): {terms_json}
+Lines spoken before this batch (source / existing subtitle translation):
+{before_txt}
+Lines spoken after this batch:
+{after_txt}
+
+## Lines to write
+Each item: `zh` = original line, `vi_draft` = existing subtitle translation (use it for names, terms and how characters address each other — xưng hô — but translate from `zh`), `budget_sec` = how long the actor speaks, `max_syllables` = hard upper limit of {tgt} syllables (words separated by spaces) that fit the budget, `emotion_hint` = rough acoustic emotion guess from the original audio (null = unclear; it can be wrong).
+
+{items_json}
+
+## Rules
+1. Natural spoken {tgt}, the way people actually talk in a dubbed drama — not written style.
+2. NEVER exceed `max_syllables`. Keep the main meaning first; drop fillers, repeated words, unnecessary modifiers and pronouns when needed. Every line must still be a complete sentence — rephrase, never cut words off the end.
+3. Keep names, terms and xưng hô consistent with `vi_draft` and the context.
+4. Do not merge, split, reorder or skip lines: exactly one output per input `id`.
+5. `style`: the delivery of the line, one of {styles}. Decide from the script context (what is said, to whom, situation); use `emotion_hint` only as supporting evidence. Pick "neutral" when unsure. Do NOT put the style into `vi`.
+6. `vi` contains only the words to speak: no brackets, no stage directions, no emoji.
+
+## Output in only JSON format and no other text
+```json
+{{
+    "lines": [
+        {{"id": 1, "vi": "spoken line", "style": "neutral", "note": "very short reason for the style"}}
+    ]
+}}
+```
+
+Note: Start you answer with ```json and end with ```, do not add any other text.
+'''.strip()
+
+
+def get_dub_shorten_prompt(zh, vi, measured_sec, budget_sec, max_syllables, before, after):
+    tgt = load_key("target_language")
+    return f'''
+## Role
+You are a dubbing script editor for **{tgt}**. The TTS reading of a line is too long for the actor's mouth timing; rewrite it shorter.
+
+## INPUT
+Original (zh): {zh}
+Current line: {vi}
+TTS reads it in {measured_sec:.2f}s but the budget is {budget_sec:.2f}s.
+Previous line: {before or "(none)"}
+Next line: {after or "(none)"}
+
+## Rules
+1. At most **{max_syllables}** syllables (words separated by spaces).
+2. Keep the main meaning; drop fillers, repeated words, modifiers and pronouns first; prefer shorter synonyms.
+3. It must still be a complete, natural sentence — rephrase instead of cutting words off the end (never end on a dangling word like "vụ", "đúng", "của").
+4. Natural spoken {tgt}; keep names, terms and xưng hô of the current line.
+5. Only the words to speak: no brackets, no stage directions.
+
+## Output in only JSON format and no other text
+```json
+{{
+    "vi": "shorter line"
+}}
+```
+
+Note: Start you answer with ```json and end with ```, do not add any other text.
+'''.strip()

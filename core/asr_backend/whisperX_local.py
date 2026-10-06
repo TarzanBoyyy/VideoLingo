@@ -84,9 +84,12 @@ def transcribe_audio(raw_audio_file, vocal_audio_file, start, end):
     
     if device == "cuda":
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        batch_size = 16 if gpu_mem > 8 else 2
+        # Batch theo VRAM CÒN TRỐNG, không phải tổng — card 12GB chia sẻ với
+        # TTS/OCR thì batch 16 OOM ngay.
+        free_mem = torch.cuda.mem_get_info(0)[0] / (1024**3)
+        batch_size = 16 if free_mem > 9 else (8 if free_mem > 5 else 2)
         compute_type = "float16" if torch.cuda.is_bf16_supported() else "int8"
-        rprint(f"[cyan]🎮 GPU memory:[/cyan] {gpu_mem:.2f} GB, [cyan]📦 Batch size:[/cyan] {batch_size}, [cyan]⚙️ Compute type:[/cyan] {compute_type}")
+        rprint(f"[cyan]🎮 GPU memory:[/cyan] {gpu_mem:.2f} GB (free {free_mem:.2f}), [cyan]📦 Batch size:[/cyan] {batch_size}, [cyan]⚙️ Compute type:[/cyan] {compute_type}")
     else:
         batch_size = 1
         compute_type = "int8"
@@ -122,16 +125,27 @@ def transcribe_audio(raw_audio_file, vocal_audio_file, start, end):
     asr_options = {"temperatures": [0],"initial_prompt": "",}
     whisper_language = None if 'auto' in WHISPER_LANGUAGE else WHISPER_LANGUAGE
     rprint("[bold yellow] You can ignore warning of `Model was trained with torch 1.10.0+cu102, yours is 2.0.0+cu118...`[/bold yellow]")
-    load_kwargs = dict(
-        device=device,
-        compute_type=compute_type,
-        language=whisper_language,
-        vad_options=vad_options,
-        asr_options=asr_options,
-    )
-    if download_root:
-        load_kwargs["download_root"] = download_root
-    model = whisperx.load_model(model_name, **load_kwargs)
+    # Cache model ở module level: batch_runner giữ tiến trình sống giữa các job,
+    # load whisper large-v3 (~3GB VRAM) một lần thay vì mỗi job/mỗi segment.
+    global _MODEL_CACHE
+    try:
+        _MODEL_CACHE
+    except NameError:
+        _MODEL_CACHE = {}
+    cache_key = (model_name, device, compute_type, whisper_language)
+    model = _MODEL_CACHE.get(cache_key)
+    if model is None:
+        load_kwargs = dict(
+            device=device,
+            compute_type=compute_type,
+            language=whisper_language,
+            vad_options=vad_options,
+            asr_options=asr_options,
+        )
+        if download_root:
+            load_kwargs["download_root"] = download_root
+        model = whisperx.load_model(model_name, **load_kwargs)
+        _MODEL_CACHE[cache_key] = model
 
     def load_audio_segment(audio_file, start, end):
         # Use whisperx's ffmpeg-based loader instead of librosa.load() which
@@ -149,13 +163,20 @@ def transcribe_audio(raw_audio_file, vocal_audio_file, start, end):
     # -------------------------
     transcribe_start_time = time.time()
     rprint("[bold green]Note: You will see Progress if working correctly ↓[/bold green]")
-    result = model.transcribe(raw_audio_segment, batch_size=batch_size, print_progress=True)
+    while True:
+        try:
+            result = model.transcribe(raw_audio_segment, batch_size=batch_size, print_progress=True)
+            break
+        except RuntimeError as ex:
+            if "out of memory" not in str(ex).lower() or batch_size <= 1:
+                raise
+            batch_size = max(1, batch_size // 2)
+            torch.cuda.empty_cache()
+            rprint(f"[yellow]⚠️ CUDA OOM — retry với batch_size={batch_size}[/yellow]")
     transcribe_time = time.time() - transcribe_start_time
     rprint(f"[cyan]⏱️ time transcribe:[/cyan] {transcribe_time:.2f}s")
 
-    # Free GPU resources
-    del model
-    torch.cuda.empty_cache()
+    # Model giữ lại trong _MODEL_CACHE (batch_runner warm giữa các job) — không del.
 
     # Save language
     update_key("whisper.language", result['language'])

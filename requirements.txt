@@ -26,6 +26,8 @@ autocorrect-py
 ctranslate2>=4.5.0
 edge-tts
 pyannote-audio>=4.0.0
+# emotion2vec+ (core/emotion.py, config dub_emotion)
+funasr==1.4.16
 
 # demucs and whisperx are installed separately in install.py
 # to avoid torchaudio version conflicts between demucs (<2.2) and whisperx (~=2.8.0).

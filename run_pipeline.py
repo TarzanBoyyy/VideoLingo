@@ -26,17 +26,13 @@ def sh(*args):
     subprocess.run(args, check=True)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("video")
-    ap.add_argument("--sub-only", action="store_true", help="stop after subtitle burn-in")
-    ap.add_argument("--keep", action="store_true", help="don't wipe output/ first")
-    args = ap.parse_args()
-
-    vid = os.path.abspath(args.video)
+def run(vid: str, sub_only: bool = False, keep: bool = False) -> None:
+    """Chạy pipeline cho một video. Tách khỏi main() để batch_runner.py gọi
+    in-process nhiều lần (model whisper/demucs được cache ở module level)."""
+    vid = os.path.abspath(vid)
     assert os.path.exists(vid), vid
 
-    if not args.keep:
+    if not keep:
         shutil.rmtree("output", ignore_errors=True)
     os.makedirs("output", exist_ok=True)
 
@@ -72,7 +68,7 @@ def main():
     print("== [7/7] Burn subtitles ==")
     _7_sub_into_vid.merge_subtitles_to_video()
 
-    if args.sub_only:
+    if sub_only:
         print(f"SUB-ONLY done in {time.time()-t0:.0f}s")
         return
 
@@ -83,6 +79,9 @@ def main():
     print("== [8] Audio tasks + chunks ==")
     _8_1_audio_task.gen_audio_task_main()
     _8_2_dub_chunks.gen_dub_chunks()
+    # dub_emotion / dub_fit (config.yaml) — tắt cả hai thì không làm gì
+    from core import dub_script
+    dub_script.build_dub_script()
 
     print("== [9] Reference audio ==")
     _9_refer_audio.extract_refer_audio_main()
@@ -97,6 +96,15 @@ def main():
     _12_dub_to_vid.merge_video_audio()
 
     print(f"FULL PIPELINE done in {time.time()-t0:.0f}s")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("video")
+    ap.add_argument("--sub-only", action="store_true", help="stop after subtitle burn-in")
+    ap.add_argument("--keep", action="store_true", help="don't wipe output/ first")
+    args = ap.parse_args()
+    run(args.video, sub_only=args.sub_only, keep=args.keep)
 
 
 if __name__ == "__main__":

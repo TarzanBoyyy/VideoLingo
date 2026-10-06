@@ -19,19 +19,31 @@ class PreloadedSeparator(Separator):
         self.update_parameter(device=device, shifts=shifts, overlap=overlap, split=split,
                             segment=segment, jobs=jobs, progress=True, callback=None, callback_arg=None)
 
+_SEP_CACHE = None
+
+def get_separator():
+    """Separator htdemucs_ft cache ở module level — batch_runner giữ tiến trình
+    sống giữa các job nên model chỉ load một lần (và tái dùng cho op demucs
+    của clone ref)."""
+    global _SEP_CACHE
+    if _SEP_CACHE is None:
+        console = Console()
+        # htdemucs_ft: bản fine-tune của htdemucs — stem sạch hơn (đặc biệt giọng nói
+        # đè nhạc), chậm ~4x nhưng vẫn nhanh trên GPU.
+        console.print("🤖 Loading <htdemucs_ft> model...")
+        model = get_model('htdemucs_ft')
+        _SEP_CACHE = (PreloadedSeparator(model=model, shifts=1, overlap=0.25), model)
+    return _SEP_CACHE
+
 def demucs_audio():
     if os.path.exists(_VOCAL_AUDIO_FILE) and os.path.exists(_BACKGROUND_AUDIO_FILE):
         rprint(f"[yellow]⚠️ {_VOCAL_AUDIO_FILE} and {_BACKGROUND_AUDIO_FILE} already exist, skip Demucs processing.[/yellow]")
         return
-    
+
     console = Console()
     os.makedirs(_AUDIO_DIR, exist_ok=True)
-    
-    # htdemucs_ft: bản fine-tune của htdemucs — stem sạch hơn (đặc biệt giọng nói
-    # đè nhạc), chậm ~4x nhưng vẫn nhanh trên GPU.
-    console.print("🤖 Loading <htdemucs_ft> model...")
-    model = get_model('htdemucs_ft')
-    separator = PreloadedSeparator(model=model, shifts=1, overlap=0.25)
+
+    separator, model = get_separator()
     
     console.print("🎵 Separating audio...")
     _, outputs = separator.separate_audio_file(_RAW_AUDIO_FILE)
@@ -46,8 +58,8 @@ def demucs_audio():
     background = sum(audio for source, audio in outputs.items() if source != 'vocals')
     save_audio(background.cpu(), _BACKGROUND_AUDIO_FILE, **kwargs)
     
-    # Clean up memory
-    del outputs, background, model, separator
+    # outputs/background là tensor lớn — giải phóng; model+separator giữ trong _SEP_CACHE.
+    del outputs, background
     gc.collect()
     
     console.print("[green]✨ Audio separation completed![/green]")
